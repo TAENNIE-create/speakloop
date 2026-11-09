@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
+import OpenAI from 'openai';
 import { createServer as createViteServer } from 'vite';
 
 dotenv.config();
@@ -15,15 +15,25 @@ const port = 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
-// Server-side Gemini AI Client
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
-});
+// Server-side OpenAI client (left null when no key is configured, so routes
+// can fall back to non-AI behavior instead of the server crashing on boot)
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
+const OPENAI_MODEL = 'gpt-4o-mini';
+
+async function generateJSON(systemInstruction: string, prompt: string): Promise<any> {
+  if (!openai) throw new Error('OPENAI_API_KEY is not set');
+  const response = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    messages: [
+      { role: 'system', content: systemInstruction },
+      { role: 'user', content: prompt },
+    ],
+    response_format: { type: 'json_object' },
+  });
+  return JSON.parse(response.choices[0]?.message?.content || '{}');
+}
 
 // Helper for fast algorithmic word diff & fallback score
 function computeFallbackEvaluation(target: string, spoken: string, isJapanese: boolean = false) {
@@ -101,7 +111,7 @@ app.post('/api/evaluate-speech', async (req, res) => {
 
     const isJapanese = language === 'ja';
 
-    if (!process.env.GEMINI_API_KEY) {
+    if (!process.env.OPENAI_API_KEY) {
       const fallback = computeFallbackEvaluation(targetSentence, spokenText, isJapanese);
       return res.json(fallback);
     }
@@ -151,46 +161,25 @@ app.post('/api/evaluate-speech', async (req, res) => {
 5. nativeAlternative: 원어민들이 일상에서 정말 자주 쓰는 자연스러운 구어체 변형이나 발음/연음 팁 (1문장).
 6. wordDiff: targetSentence의 단어들을 기준으로 각 단어의 상태를 분석한 배열.
    각 원소는 { "word": string, "status": "correct" | "missing" | "wrong" | "added" }
+
+반드시 아래 JSON 형식으로만 응답하세요:
+{
+  "score": number,
+  "passed": boolean,
+  "feedback": string,
+  "weaknessCategory": string,
+  "nativeAlternative": string,
+  "wordDiff": [{ "word": string, "status": "correct" | "missing" | "wrong" | "added" }]
+}
 `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        systemInstruction: 'You are an expert bilingual speaking tutor. Return valid JSON only.',
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            score: { type: Type.INTEGER, description: 'Score between 0 and 100' },
-            passed: { type: Type.BOOLEAN, description: 'True if score >= 75' },
-            feedback: { type: Type.STRING, description: 'Encouraging coaching feedback in Korean' },
-            weaknessCategory: {
-              type: Type.STRING,
-              description: 'Grammar/speaking weakness category',
-            },
-            nativeAlternative: { type: Type.STRING, description: 'Natural native variation or tip' },
-            wordDiff: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  word: { type: Type.STRING },
-                  status: { type: Type.STRING, description: 'correct, missing, wrong, or added' },
-                },
-                required: ['word', 'status'],
-              },
-            },
-          },
-          required: ['score', 'passed', 'feedback', 'weaknessCategory', 'nativeAlternative', 'wordDiff'],
-        },
-      },
-    });
-
-    const parsed = JSON.parse(response.text || '{}');
+    const parsed = await generateJSON(
+      'You are an expert bilingual speaking tutor. Return valid JSON only.',
+      prompt
+    );
     return res.json(parsed);
   } catch (error: any) {
-    console.error('Error evaluating speech with Gemini:', error);
+    console.error('Error evaluating speech with OpenAI:', error);
     const { targetSentence, spokenText, language } = req.body;
     const fallback = computeFallbackEvaluation(targetSentence || '', spokenText || '', language === 'ja');
     return res.json(fallback);
@@ -205,7 +194,7 @@ app.post('/api/extract-kanji', async (req, res) => {
       return res.status(400).json({ error: 'japaneseSentence is required' });
     }
 
-    if (!process.env.GEMINI_API_KEY) {
+    if (!process.env.OPENAI_API_KEY) {
       return res.json({ kanjiList: [] });
     }
 
@@ -228,17 +217,11 @@ app.post('/api/extract-kanji', async (req, res) => {
 }
 `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        systemInstruction: 'You are a master Japanese Kanji linguist. Return valid JSON only.',
-        responseMimeType: 'application/json',
-      },
-    });
-
-    const parsed = JSON.parse(response.text || '{"kanjiList": []}');
-    return res.json(parsed);
+    const parsed = await generateJSON(
+      'You are a master Japanese Kanji linguist. Return valid JSON only.',
+      prompt
+    );
+    return res.json({ kanjiList: parsed.kanjiList || [] });
   } catch (error: any) {
     console.error('Error extracting kanji:', error);
     return res.status(500).json({ error: error.message });
@@ -250,8 +233,8 @@ app.post('/api/generate-report', async (req, res) => {
   try {
     const { sentences = [], reviewLogs = [], daysCount = 10, language = 'all' } = req.body;
 
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY is not set' });
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: 'OPENAI_API_KEY is not set' });
     }
 
     const isJaOnly = language === 'ja';
@@ -283,92 +266,29 @@ ${JSON.stringify(reviewLogs.slice(0, 25), null, 2)}
 10. actionPlan: 향후 10일간 실천해야 할 구체적인 말하기 및 한자 훈독 학습 행동 지침 3가지.
 11. suggestedNewSentences: 학습자의 취약점을 극복하기 위해 추천하는 새로운 실전 문장 3~4개 ({ language, targetText, reading, korean, focusReason }).
 12. coachEncouragement: 학습자를 격려하는 따뜻한 응원 한마디.
+
+반드시 아래 JSON 형식으로만 응답하세요 (모든 필드 필수):
+{
+  "reportTitle": string,
+  "period": string,
+  "overallScore": number,
+  "masteryRate": number,
+  "totalReviews": number,
+  "kanjiMasteryRate": number,
+  "summaryDiagnosis": string,
+  "coreStrengths": string[],
+  "topWeaknesses": [{ "category": string, "frequency": number, "explanation": string, "sampleMistake": string, "correctiveRule": string }],
+  "spacedRepetitionAdjustments": [{ "category": string, "weightMultiplier": number, "reason": string }],
+  "actionPlan": string[],
+  "suggestedNewSentences": [{ "language": string, "targetText": string, "reading": string, "korean": string, "focusReason": string }],
+  "coachEncouragement": string
+}
 `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        systemInstruction: 'You are an elite bilingual Japanese & English coach providing an inspiring diagnostic report in Korean.',
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            reportTitle: { type: Type.STRING },
-            period: { type: Type.STRING },
-            overallScore: { type: Type.INTEGER },
-            masteryRate: { type: Type.INTEGER },
-            totalReviews: { type: Type.INTEGER },
-            kanjiMasteryRate: { type: Type.INTEGER },
-            summaryDiagnosis: { type: Type.STRING },
-            coreStrengths: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-            },
-            topWeaknesses: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  category: { type: Type.STRING },
-                  frequency: { type: Type.INTEGER },
-                  explanation: { type: Type.STRING },
-                  sampleMistake: { type: Type.STRING },
-                  correctiveRule: { type: Type.STRING },
-                },
-                required: ['category', 'frequency', 'explanation', 'sampleMistake', 'correctiveRule'],
-              },
-            },
-            spacedRepetitionAdjustments: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  category: { type: Type.STRING },
-                  weightMultiplier: { type: Type.NUMBER },
-                  reason: { type: Type.STRING },
-                },
-                required: ['category', 'weightMultiplier', 'reason'],
-              },
-            },
-            actionPlan: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-            },
-            suggestedNewSentences: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  language: { type: Type.STRING },
-                  targetText: { type: Type.STRING },
-                  reading: { type: Type.STRING },
-                  korean: { type: Type.STRING },
-                  focusReason: { type: Type.STRING },
-                },
-                required: ['language', 'targetText', 'korean', 'focusReason'],
-              },
-            },
-            coachEncouragement: { type: Type.STRING },
-          },
-          required: [
-            'reportTitle',
-            'overallScore',
-            'masteryRate',
-            'totalReviews',
-            'summaryDiagnosis',
-            'coreStrengths',
-            'topWeaknesses',
-            'spacedRepetitionAdjustments',
-            'actionPlan',
-            'suggestedNewSentences',
-            'coachEncouragement',
-          ],
-        },
-      },
-    });
-
-    const parsed = JSON.parse(response.text || '{}');
+    const parsed = await generateJSON(
+      'You are an elite bilingual Japanese & English coach providing an inspiring diagnostic report in Korean.',
+      prompt
+    );
     return res.json(parsed);
   } catch (error: any) {
     console.error('Error generating report:', error);
@@ -384,7 +304,7 @@ app.post('/api/parse-sentence', async (req, res) => {
       return res.status(400).json({ error: 'Input text is required' });
     }
 
-    if (!process.env.GEMINI_API_KEY) {
+    if (!process.env.OPENAI_API_KEY) {
       return res.json({
         targetText: input,
         korean: '한국어 번역을 직접 입력해주세요',
@@ -408,6 +328,16 @@ app.post('/api/parse-sentence', async (req, res) => {
 - kanjiList: 문장에 포함된 한자 단어들의 훈독/음독 상세 리스트 ({ kanji, reading, readingType, meaning })
 
 입력: "${input}"
+
+반드시 아래 JSON 형식으로만 응답하세요:
+{
+  "targetText": string,
+  "reading": string,
+  "korean": string,
+  "category": string,
+  "keyPattern": string,
+  "kanjiList": [{ "kanji": string, "reading": string, "readingType": string, "meaning": string }]
+}
 `
       : `
 입력된 문장이나 텍스트를 분석하여, 영어 학습자가 매일 복습하기 좋은 깔끔한 영어 문장과 자연스러운 한국어 뜻으로 정리해주세요.
@@ -424,16 +354,7 @@ app.post('/api/parse-sentence', async (req, res) => {
 }
 `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        systemInstruction: 'Return valid JSON only.',
-        responseMimeType: 'application/json',
-      },
-    });
-
-    const parsed = JSON.parse(response.text || '{}');
+    const parsed = await generateJSON('Return valid JSON only.', prompt);
     return res.json(parsed);
   } catch (error: any) {
     console.error('Error parsing sentence:', error);
