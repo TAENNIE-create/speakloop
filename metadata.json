@@ -1,0 +1,6 @@
+{
+  "name": "SpeakLoop - 영어 & 일본어 회화 AI 누적 복습",
+  "description": "매일 아침/저녁 영어 10문장, 일본어 10문장 음성 말하기 테스트, 한자 훈독 읽기 퀴즈 및 10일 주기 AI 약점 분석 리포트",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
