@@ -316,18 +316,25 @@ app.post('/api/parse-sentence', async (req, res) => {
     }
 
     const isJapanese = language === 'ja';
+    // If the user already typed the sentence in the target language, we must
+    // not let the model rephrase/"clean up" their wording — only translate.
+    const isKoreanInput = /[가-힣]/.test(input) && !/[぀-ヿ一-鿿]/.test(input);
+
+    const preserveInstruction = isKoreanInput
+      ? ''
+      : `\n\n중요: 입력이 이미 ${isJapanese ? '일본어' : '영어'}로 작성되어 있으므로, targetText는 입력 문장을 토씨 하나 바꾸지 말고 그대로 사용하세요. 절대 문장을 고치거나 더 자연스럽게 다듬지 마세요. 나머지 필드(번역, 분류 등)만 새로 작성하세요.`;
 
     const prompt = isJapanese
       ? `
 학습자가 입력한 일본어 또는 한국어 텍스트를 분석하여, 일본어 회화 및 한자 훈독 학습에 최적화된 데이터로 정리해주세요.
-- 일본어 문장: 한자와 히라가나가 적절히 섞인 자연스러운 일본어 문장
+- 일본어 문장: 입력이 한국어면 자연스러운 일본어로 새로 작성, 입력이 이미 일본어면 아래 "중요" 지침대로 원문 그대로 사용
 - 히라가나 읽기 (reading): 전체 문장의 후리가나/히라가나 읽는 법
 - 한국어 뜻 (korean): 매끄러운 한국어 해석
 - category: 일상 회화 / 비즈니스 / 여행/식당 / 감정/의견 / 숙어패턴 중 택1
 - keyPattern: 핵심 문형이나 조사 (예: '~ていただく', '~ほうがいい')
 - kanjiList: 문장에 포함된 한자 단어들의 훈독/음독 상세 리스트 ({ kanji, reading, readingType, meaning })
 
-입력: "${input}"
+입력: "${input}"${preserveInstruction}
 
 반드시 아래 JSON 형식으로만 응답하세요:
 {
@@ -340,14 +347,14 @@ app.post('/api/parse-sentence', async (req, res) => {
 }
 `
       : `
-입력된 문장이나 텍스트를 분석하여, 영어 학습자가 매일 복습하기 좋은 깔끔한 영어 문장과 자연스러운 한국어 뜻으로 정리해주세요.
-만약 한국어만 주어지면 가장 자연스러운 원어민 영어 회화 문장을 만들어주시고, 영어만 주어지면 매끄러운 한국어 뜻을 매겨주세요.
+입력된 문장이나 텍스트를 분석하여, 영어 학습자가 매일 복습하기 좋은 영어 문장과 자연스러운 한국어 뜻으로 정리해주세요.
+만약 한국어만 주어지면 가장 자연스러운 원어민 영어 회화 문장을 새로 만들어주시고, 입력이 이미 영어면 아래 "중요" 지침대로 원문 그대로 사용하세요.
 
-입력: "${input}"
+입력: "${input}"${preserveInstruction}
 
 출력 JSON 형식:
 {
-  "targetText": "자연스러운 영어 문장",
+  "targetText": "영어 문장",
   "korean": "자연스러운 한국어 뜻",
   "category": "일상 / 비즈니스 / 여행 / 감정표현 / 숙어패턴 중 택1",
   "keyPattern": "문장의 핵심 표현이나 문법 포인트"
@@ -355,6 +362,13 @@ app.post('/api/parse-sentence', async (req, res) => {
 `;
 
     const parsed = await generateJSON('Return valid JSON only.', prompt);
+
+    // Belt-and-suspenders: guarantee the original sentence is never altered,
+    // regardless of what the model actually returned.
+    if (!isKoreanInput) {
+      parsed.targetText = input.trim();
+    }
+
     return res.json(parsed);
   } catch (error: any) {
     console.error('Error parsing sentence:', error);
